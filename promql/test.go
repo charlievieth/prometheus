@@ -16,10 +16,13 @@ package promql
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -84,6 +87,26 @@ func RunBuiltinTests(t *testing.T, engine QueryEngine) {
 		t.Run(fn, func(t *testing.T) {
 			content, err := fs.ReadFile(testsFs, fn)
 			require.NoError(t, err)
+			{
+				test := &test{
+					T:    t,
+					cmds: []testCommand{},
+				}
+				err := test.parse(string(content))
+				if err != nil {
+					t.Fatal(err)
+				}
+				data, err := json.MarshalIndent(test.cmds, "", "    ")
+				if err != nil {
+					t.Fatalf("%v | %+v", err, err)
+				}
+				// ./a/b/foo.test => foo.json
+				base := strings.TrimSuffix(filepath.Base(fn), filepath.Ext(fn)) + ".json"
+				name := filepath.Join("testdata", base)
+				if err := os.WriteFile(name, data, 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
 			RunTest(t, string(content), engine)
 		})
 	}
@@ -280,9 +303,9 @@ func (t *test) parseEval(lines []string, i int) (int, *evalCmd, error) {
 	case "ordered":
 		// Ordered results are not supported for range queries, but the regex for range query commands does not allow
 		// asserting an ordered result, so we don't need to do any error checking here.
-		cmd.ordered = true
+		cmd.Ordered = true
 	case "fail":
-		cmd.fail = true
+		cmd.Fail = true
 	}
 
 	for j := 1; i+1 < len(lines); j++ {
@@ -366,18 +389,29 @@ func (*evalCmd) testCmd()  {}
 // loadCmd is a command that loads sequences of sample values for specific
 // metrics into the storage.
 type loadCmd struct {
-	gap       time.Duration
-	metrics   map[uint64]labels.Labels
-	defs      map[uint64][]Sample
-	exemplars map[uint64][]exemplar.Exemplar
+	Kind      loadCmdKind
+	Gap       time.Duration
+	Metrics   map[uint64]labels.Labels
+	Defs      map[uint64][]Sample
+	Exemplars map[uint64][]exemplar.Exemplar
+}
+
+type loadCmdKind struct{}
+
+func (loadCmdKind) String() string {
+	return "loadCmd"
+}
+
+func (k loadCmdKind) MarshalText() ([]byte, error) {
+	return []byte(k.String()), nil
 }
 
 func newLoadCmd(gap time.Duration) *loadCmd {
 	return &loadCmd{
-		gap:       gap,
-		metrics:   map[uint64]labels.Labels{},
-		defs:      map[uint64][]Sample{},
-		exemplars: map[uint64][]exemplar.Exemplar{},
+		Gap:       gap,
+		Metrics:   map[uint64]labels.Labels{},
+		Defs:      map[uint64][]Sample{},
+		Exemplars: map[uint64][]exemplar.Exemplar{},
 	}
 }
 
@@ -399,16 +433,16 @@ func (cmd *loadCmd) set(m labels.Labels, vals ...parser.SequenceValue) {
 				H: v.Histogram,
 			})
 		}
-		ts = ts.Add(cmd.gap)
+		ts = ts.Add(cmd.Gap)
 	}
-	cmd.defs[h] = samples
-	cmd.metrics[h] = m
+	cmd.Defs[h] = samples
+	cmd.Metrics[h] = m
 }
 
 // append the defined time series to the storage.
 func (cmd *loadCmd) append(a storage.Appender) error {
-	for h, smpls := range cmd.defs {
-		m := cmd.metrics[h]
+	for h, smpls := range cmd.Defs {
+		m := cmd.Metrics[h]
 
 		for _, s := range smpls {
 			if err := appendSample(a, s, m); err != nil {
@@ -435,50 +469,62 @@ func appendSample(a storage.Appender, s Sample, m labels.Labels) error {
 // evalCmd is a command that evaluates an expression for the given time (range)
 // and expects a specific result.
 type evalCmd struct {
-	expr  string
-	start time.Time
-	end   time.Time
-	step  time.Duration
-	line  int
+	King  evalCmdKind
+	Expr  string
+	Start time.Time
+	End   time.Time
+	Step  time.Duration
+	Line  int
 
-	isRange       bool // if false, instant query
-	fail, ordered bool
+	IsRange bool // if false, instant query
+	Fail    bool
+	Ordered bool
 
-	metrics  map[uint64]labels.Labels
-	expected map[uint64]entry
+	Metrics  map[uint64]labels.Labels
+	Expected map[uint64]entry
+}
+
+type evalCmdKind struct{}
+
+func (e evalCmdKind) String() string {
+	return "evalCmd"
+}
+
+func (e evalCmdKind) MarshalText() ([]byte, error) {
+	return []byte(e.String()), nil
 }
 
 type entry struct {
-	pos  int
-	vals []parser.SequenceValue
+	Pos  int
+	Vals []parser.SequenceValue
 }
 
 func (e entry) String() string {
-	return fmt.Sprintf("%d: %s", e.pos, e.vals)
+	return fmt.Sprintf("%d: %s", e.Pos, e.Vals)
 }
 
 func newInstantEvalCmd(expr string, start time.Time, line int) *evalCmd {
 	return &evalCmd{
-		expr:  expr,
-		start: start,
-		line:  line,
+		Expr:  expr,
+		Start: start,
+		Line:  line,
 
-		metrics:  map[uint64]labels.Labels{},
-		expected: map[uint64]entry{},
+		Metrics:  map[uint64]labels.Labels{},
+		Expected: map[uint64]entry{},
 	}
 }
 
 func newRangeEvalCmd(expr string, start, end time.Time, step time.Duration, line int) *evalCmd {
 	return &evalCmd{
-		expr:    expr,
-		start:   start,
-		end:     end,
-		step:    step,
-		line:    line,
-		isRange: true,
+		Expr:    expr,
+		Start:   start,
+		End:     end,
+		Step:    step,
+		Line:    line,
+		IsRange: true,
 
-		metrics:  map[uint64]labels.Labels{},
-		expected: map[uint64]entry{},
+		Metrics:  map[uint64]labels.Labels{},
+		Expected: map[uint64]entry{},
 	}
 }
 
@@ -489,22 +535,22 @@ func (ev *evalCmd) String() string {
 // expect adds a sequence of values to the set of expected
 // results for the query.
 func (ev *evalCmd) expect(pos int, vals ...parser.SequenceValue) {
-	ev.expected[0] = entry{pos: pos, vals: vals}
+	ev.Expected[0] = entry{Pos: pos, Vals: vals}
 }
 
 // expectMetric adds a new metric with a sequence of values to the set of expected
 // results for the query.
 func (ev *evalCmd) expectMetric(pos int, m labels.Labels, vals ...parser.SequenceValue) {
 	h := m.Hash()
-	ev.metrics[h] = m
-	ev.expected[h] = entry{pos: pos, vals: vals}
+	ev.Metrics[h] = m
+	ev.Expected[h] = entry{Pos: pos, Vals: vals}
 }
 
 // compareResult compares the result value with the defined expectation.
 func (ev *evalCmd) compareResult(result parser.Value) error {
 	switch val := result.(type) {
 	case Matrix:
-		if ev.ordered {
+		if ev.Ordered {
 			return fmt.Errorf("expected ordered result, but query returned a matrix")
 		}
 
@@ -515,20 +561,20 @@ func (ev *evalCmd) compareResult(result parser.Value) error {
 		seen := map[uint64]bool{}
 		for _, s := range val {
 			hash := s.Metric.Hash()
-			if _, ok := ev.metrics[hash]; !ok {
+			if _, ok := ev.Metrics[hash]; !ok {
 				return fmt.Errorf("unexpected metric %s in result, has %s", s.Metric, formatSeriesResult(s))
 			}
 			seen[hash] = true
-			exp := ev.expected[hash]
+			exp := ev.Expected[hash]
 
 			var expectedFloats []FPoint
 			var expectedHistograms []HPoint
 
-			for i, e := range exp.vals {
-				ts := ev.start.Add(time.Duration(i) * ev.step)
+			for i, e := range exp.Vals {
+				ts := ev.Start.Add(time.Duration(i) * ev.Step)
 
-				if ts.After(ev.end) {
-					return fmt.Errorf("expected %v points for %s, but query time range cannot return this many points", len(exp.vals), ev.metrics[hash])
+				if ts.After(ev.End) {
+					return fmt.Errorf("expected %v points for %s, but query time range cannot return this many points", len(exp.Vals), ev.Metrics[hash])
 				}
 
 				t := ts.UnixNano() / int64(time.Millisecond/time.Nanosecond)
@@ -541,18 +587,18 @@ func (ev *evalCmd) compareResult(result parser.Value) error {
 			}
 
 			if len(expectedFloats) != len(s.Floats) || len(expectedHistograms) != len(s.Histograms) {
-				return fmt.Errorf("expected %v float points and %v histogram points for %s, but got %s", len(expectedFloats), len(expectedHistograms), ev.metrics[hash], formatSeriesResult(s))
+				return fmt.Errorf("expected %v float points and %v histogram points for %s, but got %s", len(expectedFloats), len(expectedHistograms), ev.Metrics[hash], formatSeriesResult(s))
 			}
 
 			for i, expected := range expectedFloats {
 				actual := s.Floats[i]
 
 				if expected.T != actual.T {
-					return fmt.Errorf("expected float value at index %v for %s to have timestamp %v, but it had timestamp %v (result has %s)", i, ev.metrics[hash], expected.T, actual.T, formatSeriesResult(s))
+					return fmt.Errorf("expected float value at index %v for %s to have timestamp %v, but it had timestamp %v (result has %s)", i, ev.Metrics[hash], expected.T, actual.T, formatSeriesResult(s))
 				}
 
 				if !almostEqual(actual.F, expected.F, defaultEpsilon) {
-					return fmt.Errorf("expected float value at index %v (t=%v) for %s to be %v, but got %v (result has %s)", i, actual.T, ev.metrics[hash], expected.F, actual.F, formatSeriesResult(s))
+					return fmt.Errorf("expected float value at index %v (t=%v) for %s to be %v, but got %v (result has %s)", i, actual.T, ev.Metrics[hash], expected.F, actual.F, formatSeriesResult(s))
 				}
 			}
 
@@ -560,18 +606,18 @@ func (ev *evalCmd) compareResult(result parser.Value) error {
 				actual := s.Histograms[i]
 
 				if expected.T != actual.T {
-					return fmt.Errorf("expected histogram value at index %v for %s to have timestamp %v, but it had timestamp %v (result has %s)", i, ev.metrics[hash], expected.T, actual.T, formatSeriesResult(s))
+					return fmt.Errorf("expected histogram value at index %v for %s to have timestamp %v, but it had timestamp %v (result has %s)", i, ev.Metrics[hash], expected.T, actual.T, formatSeriesResult(s))
 				}
 
 				if !actual.H.Equals(expected.H.Compact(0)) {
-					return fmt.Errorf("expected histogram value at index %v (t=%v) for %s to be %v, but got %v (result has %s)", i, actual.T, ev.metrics[hash], expected.H, actual.H, formatSeriesResult(s))
+					return fmt.Errorf("expected histogram value at index %v (t=%v) for %s to be %v, but got %v (result has %s)", i, actual.T, ev.Metrics[hash], expected.H, actual.H, formatSeriesResult(s))
 				}
 			}
 		}
 
-		for hash := range ev.expected {
+		for hash := range ev.Expected {
 			if !seen[hash] {
-				return fmt.Errorf("expected metric %s not found", ev.metrics[hash])
+				return fmt.Errorf("expected metric %s not found", ev.Metrics[hash])
 			}
 		}
 
@@ -579,18 +625,18 @@ func (ev *evalCmd) compareResult(result parser.Value) error {
 		seen := map[uint64]bool{}
 		for pos, v := range val {
 			fp := v.Metric.Hash()
-			if _, ok := ev.metrics[fp]; !ok {
+			if _, ok := ev.Metrics[fp]; !ok {
 				if v.H != nil {
 					return fmt.Errorf("unexpected metric %s in result, has value %v", v.Metric, v.H)
 				}
 
 				return fmt.Errorf("unexpected metric %s in result, has value %v", v.Metric, v.F)
 			}
-			exp := ev.expected[fp]
-			if ev.ordered && exp.pos != pos+1 {
-				return fmt.Errorf("expected metric %s with %v at position %d but was at %d", v.Metric, exp.vals, exp.pos, pos+1)
+			exp := ev.Expected[fp]
+			if ev.Ordered && exp.Pos != pos+1 {
+				return fmt.Errorf("expected metric %s with %v at position %d but was at %d", v.Metric, exp.Vals, exp.Pos, pos+1)
 			}
-			exp0 := exp.vals[0]
+			exp0 := exp.Vals[0]
 			expH := exp0.Histogram
 			if expH == nil && v.H != nil {
 				return fmt.Errorf("expected float value %v for %s but got histogram %s", exp0, v.Metric, HistogramTestExpression(v.H))
@@ -607,17 +653,17 @@ func (ev *evalCmd) compareResult(result parser.Value) error {
 
 			seen[fp] = true
 		}
-		for fp, expVals := range ev.expected {
+		for fp, expVals := range ev.Expected {
 			if !seen[fp] {
-				return fmt.Errorf("expected metric %s with %v not found", ev.metrics[fp], expVals)
+				return fmt.Errorf("expected metric %s with %v not found", ev.Metrics[fp], expVals)
 			}
 		}
 
 	case Scalar:
-		if len(ev.expected) != 1 {
+		if len(ev.Expected) != 1 {
 			return fmt.Errorf("expected vector result, but got scalar %s", val.String())
 		}
-		exp0 := ev.expected[0].vals[0]
+		exp0 := ev.Expected[0].Vals[0]
 		if exp0.Histogram != nil {
 			return fmt.Errorf("expected Histogram %v but got scalar %s", exp0.Histogram.TestExpression(), val.String())
 		}
@@ -655,10 +701,22 @@ func HistogramTestExpression(h *histogram.FloatHistogram) string {
 }
 
 // clearCmd is a command that wipes the test's storage state.
-type clearCmd struct{}
+type clearCmd struct {
+	Kind clearCmdKind
+}
 
 func (cmd clearCmd) String() string {
 	return "clear"
+}
+
+type clearCmdKind struct{}
+
+func (clearCmdKind) String() string {
+	return "clearCmd"
+}
+
+func (k clearCmdKind) MarshalText() ([]byte, error) {
+	return []byte(k.String()), nil
 }
 
 type atModifierTestCase struct {
@@ -756,7 +814,7 @@ func (t *test) exec(tc testCommand, engine QueryEngine) error {
 }
 
 func (t *test) execEval(cmd *evalCmd, engine QueryEngine) error {
-	if cmd.isRange {
+	if cmd.IsRange {
 		return t.execRangeEval(cmd, engine)
 	}
 
@@ -764,69 +822,69 @@ func (t *test) execEval(cmd *evalCmd, engine QueryEngine) error {
 }
 
 func (t *test) execRangeEval(cmd *evalCmd, engine QueryEngine) error {
-	q, err := engine.NewRangeQuery(t.context, t.storage, nil, cmd.expr, cmd.start, cmd.end, cmd.step)
+	q, err := engine.NewRangeQuery(t.context, t.storage, nil, cmd.Expr, cmd.Start, cmd.End, cmd.Step)
 	if err != nil {
-		return fmt.Errorf("error creating range query for %q (line %d): %w", cmd.expr, cmd.line, err)
+		return fmt.Errorf("error creating range query for %q (line %d): %w", cmd.Expr, cmd.Line, err)
 	}
 	res := q.Exec(t.context)
 	if res.Err != nil {
-		if cmd.fail {
+		if cmd.Fail {
 			return nil
 		}
 
-		return fmt.Errorf("error evaluating query %q (line %d): %w", cmd.expr, cmd.line, res.Err)
+		return fmt.Errorf("error evaluating query %q (line %d): %w", cmd.Expr, cmd.Line, res.Err)
 	}
-	if res.Err == nil && cmd.fail {
-		return fmt.Errorf("expected error evaluating query %q (line %d) but got none", cmd.expr, cmd.line)
+	if res.Err == nil && cmd.Fail {
+		return fmt.Errorf("expected error evaluating query %q (line %d) but got none", cmd.Expr, cmd.Line)
 	}
 	defer q.Close()
 
 	if err := cmd.compareResult(res.Value); err != nil {
-		return fmt.Errorf("error in %s %s (line %d): %w", cmd, cmd.expr, cmd.line, err)
+		return fmt.Errorf("error in %s %s (line %d): %w", cmd, cmd.Expr, cmd.Line, err)
 	}
 
 	return nil
 }
 
 func (t *test) execInstantEval(cmd *evalCmd, engine QueryEngine) error {
-	queries, err := atModifierTestCases(cmd.expr, cmd.start)
+	queries, err := atModifierTestCases(cmd.Expr, cmd.Start)
 	if err != nil {
 		return err
 	}
-	queries = append([]atModifierTestCase{{expr: cmd.expr, evalTime: cmd.start}}, queries...)
+	queries = append([]atModifierTestCase{{expr: cmd.Expr, evalTime: cmd.Start}}, queries...)
 	for _, iq := range queries {
 		q, err := engine.NewInstantQuery(t.context, t.storage, nil, iq.expr, iq.evalTime)
 		if err != nil {
-			return fmt.Errorf("error creating instant query for %q (line %d): %w", cmd.expr, cmd.line, err)
+			return fmt.Errorf("error creating instant query for %q (line %d): %w", cmd.Expr, cmd.Line, err)
 		}
 		defer q.Close()
 		res := q.Exec(t.context)
 		if res.Err != nil {
-			if cmd.fail {
+			if cmd.Fail {
 				continue
 			}
-			return fmt.Errorf("error evaluating query %q (line %d): %w", iq.expr, cmd.line, res.Err)
+			return fmt.Errorf("error evaluating query %q (line %d): %w", iq.expr, cmd.Line, res.Err)
 		}
-		if res.Err == nil && cmd.fail {
-			return fmt.Errorf("expected error evaluating query %q (line %d) but got none", iq.expr, cmd.line)
+		if res.Err == nil && cmd.Fail {
+			return fmt.Errorf("expected error evaluating query %q (line %d) but got none", iq.expr, cmd.Line)
 		}
 		err = cmd.compareResult(res.Value)
 		if err != nil {
-			return fmt.Errorf("error in %s %s (line %d): %w", cmd, iq.expr, cmd.line, err)
+			return fmt.Errorf("error in %s %s (line %d): %w", cmd, iq.expr, cmd.Line, err)
 		}
 
 		// Check query returns same result in range mode,
 		// by checking against the middle step.
 		q, err = engine.NewRangeQuery(t.context, t.storage, nil, iq.expr, iq.evalTime.Add(-time.Minute), iq.evalTime.Add(time.Minute), time.Minute)
 		if err != nil {
-			return fmt.Errorf("error creating range query for %q (line %d): %w", cmd.expr, cmd.line, err)
+			return fmt.Errorf("error creating range query for %q (line %d): %w", cmd.Expr, cmd.Line, err)
 		}
 		rangeRes := q.Exec(t.context)
 		if rangeRes.Err != nil {
-			return fmt.Errorf("error evaluating query %q (line %d) in range mode: %w", iq.expr, cmd.line, rangeRes.Err)
+			return fmt.Errorf("error evaluating query %q (line %d) in range mode: %w", iq.expr, cmd.Line, rangeRes.Err)
 		}
 		defer q.Close()
-		if cmd.ordered {
+		if cmd.Ordered {
 			// Range queries are always sorted by labels, so skip this test case that expects results in a particular order.
 			continue
 		}
@@ -857,7 +915,7 @@ func (t *test) execInstantEval(cmd *evalCmd, engine QueryEngine) error {
 			err = cmd.compareResult(vec)
 		}
 		if err != nil {
-			return fmt.Errorf("error in %s %s (line %d) range mode: %w", cmd, iq.expr, cmd.line, err)
+			return fmt.Errorf("error in %s %s (line %d) range mode: %w", cmd, iq.expr, cmd.Line, err)
 		}
 	}
 
@@ -1022,19 +1080,19 @@ func (ll *LazyLoader) clear() error {
 // appendTill appends the defined time series to the storage till the given timestamp (in milliseconds).
 func (ll *LazyLoader) appendTill(ts int64) error {
 	app := ll.storage.Appender(ll.Context())
-	for h, smpls := range ll.loadCmd.defs {
-		m := ll.loadCmd.metrics[h]
+	for h, smpls := range ll.loadCmd.Defs {
+		m := ll.loadCmd.Metrics[h]
 		for i, s := range smpls {
 			if s.T > ts {
 				// Removing the already added samples.
-				ll.loadCmd.defs[h] = smpls[i:]
+				ll.loadCmd.Defs[h] = smpls[i:]
 				break
 			}
 			if err := appendSample(app, s, m); err != nil {
 				return err
 			}
 			if i == len(smpls)-1 {
-				ll.loadCmd.defs[h] = nil
+				ll.loadCmd.Defs[h] = nil
 			}
 		}
 	}
